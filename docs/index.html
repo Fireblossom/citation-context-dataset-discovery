@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="css/index.css">
+    <title>Multi-Disciplinary Dataset Discovery from Citation-Verified Literature Contexts</title>
+</head>
+<body>
+    <main>
+        <header>
+            <div class="meta-row">
+                <h3 style="color:rgb(165, 35, 28); padding: 2px 0;"> JCDL 2025 ∙ Long Paper ∙ Oral </h3>
+                <div class="github-star">
+                    <iframe
+                        src="https://ghbtns.com/github-btn.html?user=Fireblossom&repo=citation-context-dataset-discovery&type=star&count=true&size=large"
+                        frameborder="0"
+                        scrolling="0"
+                        width="170"
+                        height="30"
+                        title="GitHub"
+                    ></iframe>
+                </div>
+            </div>
+            <h2 style="padding: 10px 0;"> Multi-Disciplinary Dataset Discovery from Citation-Verified Literature Contexts </h2>
+            <h4> Author(s): 
+                <a id="paper_link" href="https://zhiyintan.github.io/">Zhiyin Tan</a>, 
+                <a id="paper_link" href="https://fireblossom.github.io/">Changxu Duan</a>
+            </h4>
+            <h4>
+                [<a id="paper_link" href="https://github.com/Fireblossom/citation-context-dataset-discovery">GitHub</a>]
+                [<a id="paper_link" href="https://doi.ieeecomputersociety.org/10.1109/JCDL67857.2025.00022">Paper</a>]
+                [<a id="paper_link" href="https://arxiv.org/abs/2601.05099">arXiv</a>]
+                [<a id="paper_link" href="https://github.com/Fireblossom/Fireblossom.github.io/blob/master/attach_files/JCDL2025_Presentation.pdf">slides</a>]
+            </h4>
+        </header>
+        
+        <div class="overview">
+            
+            <div class="image-container">
+                <img src="img/process-simple.png" alt="Dataset Discovery Pipeline" class="overview-image" style="width: 60%;">
+                <p class="image-caption">Pipeline: citation contexts → LLM extraction → entity resolution and ranking.</p>
+            </div>
+
+            <h3>Overview</h3>
+            <p>
+                Finding suitable datasets for a research question remains difficult because most dataset search engines are <span id="p_bold">metadata-driven</span> (titles, keywords, repository fields). This works when metadata is complete and terminology matches, but often fails for interdisciplinary topics or datasets with sparse/inconsistent metadata.
+            </p>
+            <p>
+                We propose a <span id="p_bold">literature-driven</span> alternative that treats <span id="p_bold">citation contexts</span> as semantic evidence of dataset usage. Given a query, we (1) retrieve relevant papers from the Semantic Scholar Academic Graph (S2AG) and collect sentence windows around citation markers, (2) apply schema-guided LLM extraction to identify dataset mentions and their roles (e.g., <span id="p_bold">Use/Modify/Evaluate Against</span>), and (3) consolidate mentions via deterministic, provenance-preserving entity resolution to produce a ranked dataset list with evidence and links (URL/PID when available).
+            </p>
+            <p>
+                On 8 survey-derived computer-science queries, we achieve <span id="p_bold">47.47%</span> average normalized recall (up to <span id="p_bold">81.82%</span>), compared to Google Dataset Search (<span id="p_bold">2.70%</span>) and DataCite Commons (<span id="p_bold">0.00%</span>). Expert assessments across five top-level Fields of Science beyond computer science suggest a substantial portion of the additional datasets are high-utility, and some are novel for the chosen topics.
+                Across the CS benchmarks, the system extracts <span id="p_bold">1,330</span> unique dataset entities, with <span id="p_bold">68.52%</span> carrying a DOI/PID signal.
+            </p>
+     
+            <div class="image-container">
+                <img src="img/process-complex.png" alt="Detailed System Architecture" class="overview-image">
+                <p class="image-caption">Workflow: query → citation contexts → LLM extraction → entity resolution.</p>
+            </div>
+
+            <p>Key contributions include:</p>
+            <ul>
+                <li> <span id="p_bold">Citation-context mining paradigm</span> that bridges research questions to datasets using usage evidence from scientific papers (not just metadata). </li>
+                <li> <span id="p_bold">Scalable context retrieval</span> over S2AG with configurable citation directions (citing/cited) and optional LLM pre-filtering for relevance. </li>
+                <li> <span id="p_bold">Schema-guided LLM extraction</span> that returns structured records grounded in text (dataset name, evidence span, usage role, and confidence), enabling downstream validation and analysis. </li>
+                <li> <span id="p_bold">Provenance-preserving entity resolution</span> that consolidates name variants deterministically and enriches entities with links (URL/PID) for practical access and auditing. </li>
+            </ul>
+        </div>
+
+        <div class="citation">
+            <h3>How to Cite</h3>
+            <div class="bibtex-box">
+                <button class="copy-btn" onclick="copyBib()">Copy BibTeX</button>
+                <pre id="bibtex">
+@inproceedings{tan2025dataset,
+    title = {Multi-Disciplinary Dataset Discovery from Citation-Verified Literature Contexts},
+    url = {http://dx.doi.org/10.1109/JCDL67857.2025.00022},
+    DOI = {10.1109/jcdl67857.2025.00022},
+    booktitle = {2025 ACM/IEEE Joint Conference on Digital Libraries (JCDL)},
+    publisher = {IEEE},
+    author = {Tan,  Zhiyin and Duan,  Changxu},
+    year = {2025},
+    month = Dec,
+    pages = {109–118}
+}
+                </pre>
+            </div>
+            <div id="popup" class="popup">BibTeX copied!</div>
+            </div>
+        <script>
+            function copyBib() {
+            const text = document.getElementById("bibtex").innerText;
+            navigator.clipboard.writeText(text).then(() => {
+                const popup = document.getElementById("popup");
+                popup.style.display = "block";
+                setTimeout(() => {
+                popup.style.display = "none";
+                }, 500);
+            });
+            }
+        </script>
+    <footer>
+        <p>Copyright &copy; 2025. All rights reserved.</p>
+    </footer>
+    </main>
+</body>
+</html>
