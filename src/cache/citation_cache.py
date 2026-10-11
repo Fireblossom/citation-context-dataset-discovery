@@ -1,23 +1,29 @@
 """
-Citation Cache Builder - Complete implementation
+Citation Cache Builder
 
-Creates and manages citation cache tables (citing_aggregated, citation_details) from Semantic Scholar parquet files.
+Builds and queries the citation cache (tables ``citation_details`` and
+``citing_aggregated``) from Semantic Scholar ``citations`` parquet files.
+
+The input directory may hold a full S2 release plus later incremental update
+files. Every citation is keyed by ``citationid`` and only its version from the
+newest file is kept, so updates replace rows instead of being counted twice.
 """
 
-import duckdb
+from __future__ import annotations
+
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import sys
-import os
+from src.cache.base import DuckDBCache, DuckDBSettings, list_parquet_files, sql_literal
+from src.config import CITATION_CACHE_DB, DEFAULT_CACHE_DIR
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+# Range of citingcorpusid values aggregated per INSERT. citation_details is
+# sorted by citingcorpusid, so each range only reads its own row groups.
+DEFAULT_ID_BATCH_SIZE = 5_000_000
 
-from src.config import DEFAULT_CACHE_DIR, CITATION_CACHE_DB
 
-
-class CitationCacheBuilder:
+class CitationCacheBuilder(DuckDBCache):
     """
     Optimized cache builder for citation contexts.
 
@@ -27,201 +33,166 @@ class CitationCacheBuilder:
     - Batch query for papers that cite a given paper
     """
 
-    def __init__(self, data_dir: str = "data/citations", cache_dir: str = None):
+    def __init__(
+        self,
+        data_dir: str = "data/citations",
+        cache_dir: Optional[str] = None,
+        settings: Optional[DuckDBSettings] = None,
+    ):
         """
-        Initialize the citation cache builder.
-
         Args:
-            data_dir: Path to citation parquet files
-            cache_dir: Path to store DuckDB cache database
+            data_dir: Directory with citation parquet files
+            cache_dir: Directory holding the DuckDB cache database
+            settings: DuckDB resource settings (detected when omitted)
         """
+        super().__init__(cache_dir or DEFAULT_CACHE_DIR, CITATION_CACHE_DB, settings)
         self.data_dir = data_dir
-        self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
-
-        # Create cache directory
-        Path(self.cache_dir).mkdir(exist_ok=True)
-
-        # Connect to persistent database
-        db_file = Path(self.cache_dir) / CITATION_CACHE_DB
-        try:
-            self.con = duckdb.connect(str(db_file))
-            print(f"Connected to database: {db_file}")
-
-            test_result = self.con.execute("SELECT 1").fetchone()
-            if test_result[0] != 1:
-                raise Exception("数据库连接测试失败")
-            print("Database connection test successful")
-
-        except Exception as e:
-            print(f"连接数据库失败: {e}")
-            raise
-
-        self._setup_optimizations()
-
-    def _setup_optimizations(self):
-        """Configure DuckDB performance parameters."""
-        self.con.execute("SET memory_limit='1TB'")
-        self.con.execute("SET threads=32")
-        self.con.execute("SET enable_progress_bar=true")
-        self.con.execute("SET preserve_insertion_order=false")
-        self.con.execute("SET temp_directory='/tmp'")
-        self.con.execute("SET checkpoint_threshold='1GB'")
-        self.con.execute("SET wal_autocheckpoint='1GB'")
-        print("DuckDB optimization parameters set")
 
     def check_table_ready(self) -> bool:
         """Check if cache tables exist and have data."""
         try:
-            agg_exists = self.con.execute(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'citing_aggregated'"
-            ).fetchone()[0]
-            detail_exists = self.con.execute(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'citation_details'"
-            ).fetchone()[0]
-
-            if agg_exists and detail_exists:
-                agg_count = self.con.execute(
-                    "SELECT COUNT(*) FROM citing_aggregated"
-                ).fetchone()[0]
-                detail_count = self.con.execute(
-                    "SELECT COUNT(*) FROM citation_details"
-                ).fetchone()[0]
-                print(f"[OK] 引用缓存表已就绪")
-                print(f"  聚合表: {agg_count:,} rows")
-                print(f"  详细表: {detail_count:,} rows")
-                return agg_count > 0 and detail_count > 0
-            return False
+            if not (
+                self.table_exists("citing_aggregated")
+                and self.table_exists("citation_details")
+            ):
+                return False
+            agg_count = self.row_count("citing_aggregated")
+            detail_count = self.row_count("citation_details")
+            print("[OK] Citation cache tables ready")
+            print(f"  citing_aggregated: {agg_count:,} rows")
+            print(f"  citation_details: {detail_count:,} rows")
+            return agg_count > 0 and detail_count > 0
         except Exception:
             return False
 
-    def create_optimized_cache_table(self, force_recreate: bool = False) -> bool:
+    # ==================== Build ====================
+
+    def create_optimized_cache_table(
+        self,
+        force_recreate: bool = False,
+        id_batch_size: int = DEFAULT_ID_BATCH_SIZE,
+        create_indexes: bool = True,
+    ) -> bool:
         """
-        Create optimized cache tables from parquet files.
+        Create the citation cache tables from parquet files.
 
         Args:
-            force_recreate: Force recreate even if tables exist
+            force_recreate: Rebuild even if the tables already exist
+            id_batch_size: citingcorpusid range aggregated per batch
+            create_indexes: Create ART indexes on the corpus ID columns
 
         Returns:
             True if successful
         """
-        print("=== 开始创建优化的缓存表 ===")
+        print("=== Building citation cache ===")
 
-        # Check existing tables
-        agg_exists = self.con.execute(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'citing_aggregated'"
-        ).fetchone()[0]
-        detail_exists = self.con.execute(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'citation_details'"
-        ).fetchone()[0]
-
-        if agg_exists and detail_exists and not force_recreate:
-            agg_count = self.con.execute(
-                "SELECT COUNT(*) FROM citing_aggregated"
-            ).fetchone()[0]
-            detail_count = self.con.execute(
-                "SELECT COUNT(*) FROM citation_details"
-            ).fetchone()[0]
+        if (
+            self.table_exists("citing_aggregated")
+            and self.table_exists("citation_details")
+            and not force_recreate
+        ):
             print(
-                f"发现现有缓存表：聚合表 {agg_count:,} rows，详细表 {detail_count:,} rows"
+                f"Existing cache found: citing_aggregated "
+                f"{self.row_count('citing_aggregated'):,} rows, citation_details "
+                f"{self.row_count('citation_details'):,} rows"
             )
-            print("使用现有缓存表（使用 force_recreate=True 强制重建）")
+            print("Using existing cache (pass force_recreate=True to rebuild)")
             return True
 
-        # Check data directory
-        data_path = Path(self.data_dir)
-        if not data_path.exists():
-            raise FileNotFoundError(f"数据目录不存在: {self.data_dir}")
-
-        parquet_files = list(data_path.glob("*.parquet"))
+        parquet_files = list_parquet_files(self.data_dir)
         if not parquet_files:
-            raise FileNotFoundError(f"Not foundparquet文件: {self.data_dir}")
-
+            raise FileNotFoundError(f"No parquet files found in: {self.data_dir}")
         total_size = sum(f.stat().st_size for f in parquet_files)
         print(
-            f"Found {len(parquet_files)} 个parquet文件，总大小: {total_size / (1024**3):.2f} GB"
+            f"Found {len(parquet_files)} parquet files, "
+            f"{total_size / (1024**3):.2f} GB"
         )
 
         start_time = time.time()
 
-        # Step 1: Filter data
-        print("\n步骤1: 过滤数据...")
-        self.con.execute(f"""
-            CREATE OR REPLACE TABLE filtered_data AS
-            SELECT 
-                citingcorpusid,
-                citedcorpusid,
-                isinfluential,
-                contexts,
-                intents,
-                citationid
-            FROM read_parquet('{self.data_dir}/*.parquet')
-            WHERE contexts IS NOT NULL 
-            AND ARRAY_LENGTH(contexts) > 0
-            AND contexts != ARRAY['null']
-        """)
+        print("\nStep 1: Deduplicate, filter and sort into citation_details...")
+        self._create_detail_table()
 
-        filtered_count = self.con.execute(
-            "SELECT COUNT(*) FROM filtered_data"
-        ).fetchone()[0]
-        total_count = self.con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{self.data_dir}/*.parquet')"
-        ).fetchone()[0]
+        print("\nStep 2: Aggregate per citing paper into citing_aggregated...")
+        self._create_aggregated_table(id_batch_size)
 
-        print(f"原始数据: {total_count:,} rows")
-        print(
-            f"过滤后: {filtered_count:,} rows ({filtered_count / total_count * 100:.2f}%)"
-        )
+        if create_indexes:
+            print("\nStep 3: Create indexes...")
+            step_start = time.time()
+            self.con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_citingcorpusid ON citing_aggregated(citingcorpusid)"
+            )
+            self.con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_citation_count ON citing_aggregated(citation_count)"
+            )
+            self.con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_detail_citing ON citation_details(citingcorpusid)"
+            )
+            self.con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_detail_cited ON citation_details(citedcorpusid)"
+            )
+            print(f"Indexes created in {time.time() - step_start:.0f}s")
 
-        # Step 2: Create aggregated table
-        print("\n步骤2: 创建聚合表...")
-        self._create_aggregated_table(filtered_count)
-
-        # Step 3: Create indexes
-        print("\n步骤3: 创建索引...")
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_citingcorpusid ON citing_aggregated(citingcorpusid)"
-        )
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_citation_count ON citing_aggregated(citation_count)"
-        )
-
-        # Step 4: Create detail table
-        print("\n步骤4: 创建详细表...")
-        self.con.execute("""
-            CREATE OR REPLACE TABLE citation_details AS
-            SELECT 
-                citingcorpusid,
-                citedcorpusid,
-                isinfluential,
-                contexts,
-                intents,
-                citationid
-            FROM filtered_data
-            ORDER BY citingcorpusid, citedcorpusid
-        """)
-
-        detail_count = self.con.execute(
-            "SELECT COUNT(*) FROM citation_details"
-        ).fetchone()[0]
-        print(f"详细表: {detail_count:,} rows")
-
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_detail_citing ON citation_details(citingcorpusid)"
-        )
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_detail_cited ON citation_details(citedcorpusid)"
-        )
-
-        # Cleanup
-        self.con.execute("DROP TABLE IF EXISTS filtered_data")
-
-        elapsed = time.time() - start_time
-        print(f"\n=== 缓存表创建完成！耗时: {elapsed:.2f}s ===")
-
+        self.con.execute("CHECKPOINT")
+        print(f"\n=== Citation cache built in {time.time() - start_time:.0f}s ===")
         return True
 
-    def _create_aggregated_table(self, total_rows: int):
-        """Create aggregated table in batches to avoid memory issues."""
+    def _create_detail_table(self):
+        step_start = time.time()
+        source = (
+            f"read_parquet({sql_literal(Path(self.data_dir) / '*.parquet')}, "
+            "filename = true, union_by_name = true)"
+        )
+
+        # Only citations present in more than one file need the (expensive)
+        # window; everything else passes straight through.
+        self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE duplicate_citations AS
+            SELECT citationid
+            FROM {source}
+            WHERE citationid IS NOT NULL
+            GROUP BY citationid
+            HAVING COUNT(*) > 1
+        """)
+        duplicates = self.row_count("duplicate_citations")
+        print(f"citationids present in more than one file: {duplicates:,}")
+
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE citation_details AS
+            WITH source AS (
+                SELECT citingcorpusid, citedcorpusid, isinfluential,
+                       contexts, intents, citationid, filename
+                FROM {source}
+            ),
+            latest AS (
+                SELECT * FROM source
+                WHERE citationid IS NULL
+                   OR citationid NOT IN (SELECT citationid FROM duplicate_citations)
+                UNION ALL
+                SELECT * FROM source
+                WHERE citationid IN (SELECT citationid FROM duplicate_citations)
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY citationid ORDER BY filename DESC
+                ) = 1
+            )
+            SELECT citingcorpusid, citedcorpusid, isinfluential,
+                   contexts, intents, citationid
+            FROM latest
+            WHERE contexts IS NOT NULL
+              AND ARRAY_LENGTH(contexts) > 0
+              AND contexts != ARRAY['null']
+            ORDER BY citingcorpusid, citedcorpusid
+        """)
+        self.con.execute("DROP TABLE IF EXISTS duplicate_citations")
+
+        detail_count = self.row_count("citation_details")
+        print(
+            f"citation_details: {detail_count:,} rows with contexts "
+            f"({time.time() - step_start:.0f}s)"
+        )
+
+    def _create_aggregated_table(self, id_batch_size: int):
+        step_start = time.time()
         self.con.execute("""
             CREATE OR REPLACE TABLE citing_aggregated (
                 citingcorpusid BIGINT,
@@ -234,79 +205,60 @@ class CitationCacheBuilder:
             )
         """)
 
-        self.con.execute("""
-            CREATE OR REPLACE TEMP TABLE temp_aggregated (
-                citingcorpusid BIGINT,
-                citation_count BIGINT,
-                unique_cited_count BIGINT,
-                influential_count BIGINT,
-                all_cited_papers VARCHAR,
-                all_contexts VARCHAR,
-                all_intents VARCHAR
-            )
-        """)
+        min_id, max_id = self.con.execute(
+            "SELECT MIN(citingcorpusid), MAX(citingcorpusid) FROM citation_details"
+        ).fetchone()
+        if min_id is None:
+            print("citation_details is empty, nothing to aggregate")
+            return
 
-        batch_size = 5000000
-        total_batches = (total_rows + batch_size - 1) // batch_size
+        total_batches = (max_id - min_id) // id_batch_size + 1
+        print(
+            f"citingcorpusid range {min_id:,}..{max_id:,}: "
+            f"{total_batches} batches of {id_batch_size:,} IDs"
+        )
 
-        print(f"分批处理: {total_batches} 批次，每批 {batch_size:,} rows")
-
-        self.con.execute("BEGIN TRANSACTION")
-
-        try:
-            for batch_num in range(total_batches):
-                batch_start = batch_num * batch_size
-                batch_end = (batch_num + 1) * batch_size - 1
-
-                print(f"  处理批次 {batch_num + 1}/{total_batches}...")
-
-                batch_result = self.con.execute(
-                    f"""
-                    SELECT 
-                        citingcorpusid,
-                        COUNT(*) as citation_count,
-                        COUNT(DISTINCT citedcorpusid) as unique_cited_count,
-                        SUM(CASE WHEN isinfluential = true THEN 1 ELSE 0 END) as influential_count,
-                        STRING_AGG(DISTINCT citedcorpusid::VARCHAR, ',') as all_cited_papers,
-                        STRING_AGG(DISTINCT contexts, ' | ') as all_contexts,
-                        STRING_AGG(DISTINCT intents, ' | ') as all_intents
-                    FROM filtered_data
-                    WHERE citingcorpusid BETWEEN ? AND ?
-                    GROUP BY citingcorpusid
+        # contexts/intents are lists; cast them explicitly (newer DuckDB versions
+        # no longer cast lists to VARCHAR implicitly, older ones did exactly this).
+        for batch_num, batch_start in enumerate(
+            range(min_id, max_id + 1, id_batch_size), start=1
+        ):
+            batch_end = batch_start + id_batch_size - 1
+            self.con.execute(
+                """
+                INSERT INTO citing_aggregated
+                SELECT
+                    citingcorpusid,
+                    COUNT(*) AS citation_count,
+                    COUNT(DISTINCT citedcorpusid) AS unique_cited_count,
+                    SUM(CASE WHEN isinfluential = true THEN 1 ELSE 0 END) AS influential_count,
+                    STRING_AGG(DISTINCT citedcorpusid::VARCHAR, ',') AS all_cited_papers,
+                    STRING_AGG(DISTINCT contexts::VARCHAR, ' | ') AS all_contexts,
+                    STRING_AGG(DISTINCT intents::VARCHAR, ' | ') AS all_intents
+                FROM citation_details
+                WHERE citingcorpusid BETWEEN ? AND ?
+                GROUP BY citingcorpusid
                 """,
-                    [batch_start, batch_end],
-                ).df()
+                [batch_start, batch_end],
+            )
+            if batch_num % 10 == 0 or batch_num == total_batches:
+                print(
+                    f"  batch {batch_num}/{total_batches} done "
+                    f"({time.time() - step_start:.0f}s)"
+                )
 
-                if not batch_result.empty:
-                    self.con.execute(
-                        "INSERT INTO temp_aggregated SELECT * FROM batch_result"
-                    )
+        agg_count = self.row_count("citing_aggregated")
+        print(
+            f"citing_aggregated: {agg_count:,} rows ({time.time() - step_start:.0f}s)"
+        )
 
-                if (batch_num + 1) % 10 == 0:
-                    self.con.execute("COMMIT")
-                    self.con.execute("BEGIN TRANSACTION")
-                    print(f"    已提交 {batch_num + 1}/{total_batches}")
-
-            self.con.execute("COMMIT")
-        except Exception as e:
-            self.con.execute("ROLLBACK")
-            raise e
-
-        # Copy and sort
-        self.con.execute("INSERT INTO citing_aggregated SELECT * FROM temp_aggregated")
-
-        agg_count = self.con.execute(
-            "SELECT COUNT(*) FROM citing_aggregated"
-        ).fetchone()[0]
-        print(f"聚合表: {agg_count:,} rows")
-
-        self.con.execute("DROP TABLE IF EXISTS temp_aggregated")
+    # ==================== Queries ====================
 
     def batch_query_contexts(
         self,
         citingcorpusid_list: List[int],
         include_details: bool = True,
-        max_results_per_id: int = None,
+        max_results_per_id: Optional[int] = None,
     ) -> Dict:
         """
         Batch query citation contexts for citing papers.
@@ -317,7 +269,7 @@ class CitationCacheBuilder:
             max_results_per_id: Maximum results per ID
 
         Returns:
-            Dictionary with results keyed by corpus ID
+            Dictionary with results keyed by corpus ID, plus "query_stats"
         """
         if not citingcorpusid_list:
             return {}
@@ -328,74 +280,60 @@ class CitationCacheBuilder:
 
         start_time = time.time()
         results = {}
-
-        # Query aggregated info
-        print("Querying aggregated info...")
         placeholders = ",".join(["?" for _ in citingcorpusid_list])
 
-        agg_query = f"""
-            SELECT 
-                citingcorpusid,
-                citation_count,
-                unique_cited_count,
-                influential_count
+        print("Querying aggregated info...")
+        agg_results = self.con.execute(
+            f"""
+            SELECT citingcorpusid, citation_count, unique_cited_count, influential_count
             FROM citing_aggregated
             WHERE citingcorpusid IN ({placeholders})
-        """
-        agg_results = self.con.execute(agg_query, citingcorpusid_list).df()
+            """,
+            citingcorpusid_list,
+        ).df()
 
-        # Initialize results
         for _, row in agg_results.iterrows():
-            cid = row["citingcorpusid"]
-            results[cid] = {
+            results[row["citingcorpusid"]] = {
                 "citation_count": int(row["citation_count"]),
                 "unique_cited_count": int(row["unique_cited_count"]),
                 "influential_count": int(row["influential_count"]),
                 "citation_details": [],
             }
 
-        # Query details if requested
         if include_details:
             print("Querying detailed citation info...")
-            detail_query = f"""
-                SELECT 
-                    citingcorpusid,
-                    citedcorpusid,
-                    isinfluential,
-                    contexts,
-                    intents
+            detail_results = self.con.execute(
+                f"""
+                SELECT citingcorpusid, citedcorpusid, isinfluential, contexts, intents
                 FROM citation_details
                 WHERE citingcorpusid IN ({placeholders})
-            """
-            detail_results = self.con.execute(detail_query, citingcorpusid_list).df()
+                """,
+                citingcorpusid_list,
+            ).df()
 
             print("Processing query results...")
             for _, row in detail_results.iterrows():
                 citing_id = row["citingcorpusid"]
-                if citing_id in results:
-                    detail = {
-                        "citedcorpusid": row["citedcorpusid"],
-                        "isinfluential": bool(row["isinfluential"]),
-                        "contexts": row["contexts"],
-                        "intents": row["intents"],
-                    }
-                    if (
-                        max_results_per_id is None
-                        or len(results[citing_id]["citation_details"])
-                        < max_results_per_id
-                    ):
-                        results[citing_id]["citation_details"].append(detail)
+                if citing_id not in results:
+                    continue
+                details = results[citing_id]["citation_details"]
+                if max_results_per_id is None or len(details) < max_results_per_id:
+                    details.append(
+                        {
+                            "citedcorpusid": row["citedcorpusid"],
+                            "isinfluential": bool(row["isinfluential"]),
+                            "contexts": row["contexts"],
+                            "intents": row["intents"],
+                        }
+                    )
 
         elapsed = time.time() - start_time
-
         found_ids = len(results)
-        total_results = sum(
-            len(r.get("citation_details", [])) for r in results.values()
-        )
+        total_results = sum(len(r["citation_details"]) for r in results.values())
 
-        print(f"Query complete!")
-        print(f"Found的ID: {found_ids}")
-        print(f"Not found的ID: {len(citingcorpusid_list) - found_ids}")
+        print("Query complete!")
+        print(f"Found IDs: {found_ids}")
+        print(f"Not found IDs: {len(citingcorpusid_list) - found_ids}")
         print(f"Total results: {total_results}")
         print(f"Query time: {elapsed:.4f}s")
 
@@ -405,11 +343,10 @@ class CitationCacheBuilder:
             "total_results": total_results,
             "query_time": elapsed,
         }
-
         return results
 
     def batch_query_citing_papers(
-        self, citedcorpusid_list: List[int], max_results_per_id: int = None
+        self, citedcorpusid_list: List[int], max_results_per_id: Optional[int] = None
     ) -> Dict:
         """
         Query papers that cite the given papers.
@@ -419,7 +356,7 @@ class CitationCacheBuilder:
             max_results_per_id: Maximum results per ID
 
         Returns:
-            Dictionary with results keyed by cited corpus ID
+            Dictionary with results keyed by cited corpus ID, plus "query_stats"
         """
         if not citedcorpusid_list:
             return {}
@@ -429,52 +366,41 @@ class CitationCacheBuilder:
 
         start_time = time.time()
         results = {}
-
-        print("Querying citation info (by citedcorpusid)...")
         placeholders = ",".join(["?" for _ in citedcorpusid_list])
 
-        query = f"""
-            SELECT 
-                citedcorpusid,
-                citingcorpusid,
-                isinfluential,
-                contexts,
-                intents
+        print("Querying citation info (by citedcorpusid)...")
+        query_results = self.con.execute(
+            f"""
+            SELECT citedcorpusid, citingcorpusid, isinfluential, contexts, intents
             FROM citation_details
             WHERE citedcorpusid IN ({placeholders})
             ORDER BY citedcorpusid, citingcorpusid
-        """
-
-        query_results = self.con.execute(query, citedcorpusid_list).df()
+            """,
+            citedcorpusid_list,
+        ).df()
 
         print("Processing query results...")
         for _, row in query_results.iterrows():
-            cited_id = row["citedcorpusid"]
-
-            if cited_id not in results:
-                results[cited_id] = {"citing_papers": []}
-
-            citing_info = {
-                "citingcorpusid": row["citingcorpusid"],
-                "isinfluential": bool(row["isinfluential"]),
-                "contexts": row["contexts"],
-                "intents": row["intents"],
-            }
-
-            if (
-                max_results_per_id is None
-                or len(results[cited_id]["citing_papers"]) < max_results_per_id
-            ):
-                results[cited_id]["citing_papers"].append(citing_info)
+            citing_papers = results.setdefault(
+                row["citedcorpusid"], {"citing_papers": []}
+            )["citing_papers"]
+            if max_results_per_id is None or len(citing_papers) < max_results_per_id:
+                citing_papers.append(
+                    {
+                        "citingcorpusid": row["citingcorpusid"],
+                        "isinfluential": bool(row["isinfluential"]),
+                        "contexts": row["contexts"],
+                        "intents": row["intents"],
+                    }
+                )
 
         elapsed = time.time() - start_time
-
         found_ids = len(results)
         total_citing = sum(len(r["citing_papers"]) for r in results.values())
 
-        print(f"Query complete!")
-        print(f"Found的被引论文ID: {found_ids}")
-        print(f"Not found的ID: {len(citedcorpusid_list) - found_ids}")
+        print("Query complete!")
+        print(f"Found cited paper IDs: {found_ids}")
+        print(f"Not found IDs: {len(citedcorpusid_list) - found_ids}")
         print(f"Total citation records: {total_citing}")
         print(f"Query time: {elapsed:.4f}s")
 
@@ -484,74 +410,24 @@ class CitationCacheBuilder:
             "total_citing_papers": total_citing,
             "query_time": elapsed,
         }
-
         return results
 
     def show_cache_info(self):
         """Display cache statistics."""
-        print("\n=== 缓存表信息 ===")
-
+        print("\n=== Citation cache info ===")
         try:
-            agg_stats = self.con.execute("""
-                SELECT 
-                    COUNT(*) as total_papers,
-                    AVG(citation_count) as avg_citations,
-                    MAX(citation_count) as max_citations,
-                    SUM(citation_count) as total_citations
+            total, avg_citations, max_citations, total_citations = self.con.execute("""
+                SELECT COUNT(*), AVG(citation_count), MAX(citation_count), SUM(citation_count)
                 FROM citing_aggregated
             """).fetchone()
-
-            print(f"论文总数: {agg_stats[0]:,}")
-            print(f"平均引用数: {agg_stats[1]:.2f}")
-            print(f"最大引用数: {agg_stats[2]:,}")
-            print(f"总引用数: {agg_stats[3]:,}")
-
-            detail_count = self.con.execute(
-                "SELECT COUNT(*) FROM citation_details"
-            ).fetchone()[0]
-            print(f"详细引用关系数: {detail_count:,}")
-
+            print(f"Citing papers: {total:,}")
+            print(f"Avg citations with context per paper: {avg_citations:.2f}")
+            print(f"Max citations with context per paper: {max_citations:,}")
+            print(f"Total citations with context: {total_citations:,}")
+            print(f"citation_details rows: {self.row_count('citation_details'):,}")
         except Exception as e:
-            print(f"获取信息时出错: {e}")
-
-    def close(self):
-        """Close database connection."""
-        try:
-            if hasattr(self, "con") and self.con:
-                self.con.close()
-        except Exception as e:
-            print(f"关闭连接时出错: {e}")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+            print(f"Error reading cache info: {e}")
 
 
 # Alias for backward compatibility
 OptimizedCacheBuilder = CitationCacheBuilder
-
-
-def main():
-    """Main function for CLI usage."""
-    print("=== Citation contexts缓存构建器 ===")
-
-    try:
-        with CitationCacheBuilder() as builder:
-            if builder.create_optimized_cache_table():
-                builder.show_cache_info()
-
-        print("\n[OK] 程序执行完成")
-
-    except KeyboardInterrupt:
-        print("\n用户中断操作")
-    except Exception as e:
-        print(f"发生错误: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()

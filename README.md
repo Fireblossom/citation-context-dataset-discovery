@@ -38,14 +38,35 @@ The pipeline consists of sequential stages:
 
 ### Stage 1: Build Cache
 
-Build optimized cache tables from S2AG data:
+Build optimized cache tables from S2AG data. The builders read parquet files from
+`<data-dir>/{papers,abstracts,paper-ids,citations}/`; raw S2AG downloads
+(`*.jsonl.gz`, full release plus incremental update files in the same directories)
+can be converted on the way with `--convert-from`:
 
 ```bash
+# Convert raw S2AG jsonl.gz to parquet, then build both caches
+python scripts/1_build_cache.py --all --convert-from /path/to/s2ag/raw --data-dir data --workers 32
+
 python scripts/1_build_cache.py --papers --data-dir /path/to/s2ag/data
 python scripts/1_build_cache.py --citations --data-dir /path/to/s2ag/data
 
 # Incremental update
 python scripts/1_build_cache.py --papers --incremental
+```
+
+When a release and later update files are present, every paper, abstract,
+paper ID and citation is taken from the newest file that contains it (S2AG
+file names start with a timestamp).
+
+The full build is memory hungry (on the order of 1 TB of RAM for the complete
+S2AG citations dataset). DuckDB's memory limit, thread count and spill directory
+are derived from the Slurm allocation / cgroup / host and can be overridden with
+`--memory-limit`, `--threads`, `--temp-dir`, `--max-temp-size` or the
+`CCDD_DUCKDB_*` environment variables. A Slurm job only needs CPUs and memory:
+
+```bash
+sbatch -c 64 --mem=1500G -t 2-00:00:00 --wrap \
+  "python scripts/1_build_cache.py --all --convert-from /path/to/s2ag/raw --data-dir data --workers 60"
 ```
 
 ### Stage 2: Query Citation Contexts
