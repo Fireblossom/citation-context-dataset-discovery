@@ -60,6 +60,10 @@ def convert_one_file(
     """
     Convert one file and return (success, message, row_count)
     """
+    # Write to a temporary name and rename on success, so a file that fails
+    # halfway (e.g. a truncated .gz) never leaves a partial parquet behind that
+    # later runs would skip as "already converted".
+    tmp_file = output_file.with_name(output_file.name + ".tmp")
     try:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -123,7 +127,7 @@ def convert_one_file(
 
                     first_schema = pa.schema(nullable_fields)
                     writer = pq.ParquetWriter(
-                        output_file, first_schema, compression="zstd"
+                        tmp_file, first_schema, compression="zstd"
                     )
 
                 if table.schema != first_schema:
@@ -134,9 +138,13 @@ def convert_one_file(
             if writer is not None:
                 writer.close()
 
+        if writer is not None:
+            tmp_file.replace(output_file)
         return True, f"Converted {total_rows} rows", total_rows
 
     except Exception as e:
+        if tmp_file.exists():
+            tmp_file.unlink()
         error_msg = f"Error: {str(e)}"
         return False, error_msg, 0
 
