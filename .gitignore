@@ -1,8 +1,8 @@
 # Data directories
-backup/
-cache/
-raw_data/
-data/
+/backup/
+/cache/
+/raw_data/
+/data/
 
 # Python
 __pycache__/
@@ -58,8 +58,8 @@ Thumbs.db
 # Outputs
 *.tsv
 *.csv
-output/
-results/
+/output/
+/results/
 *_output/
 topic_model_output/
 
