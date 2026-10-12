@@ -7,7 +7,7 @@ Builds and queries the citation cache (tables ``citation_details`` and
 The input directory may hold a full S2 release plus later incremental update
 files. Every citation is keyed by ``citationid`` and only one version is kept,
 so updates replace rows instead of being counted twice: the newest version that
-has contexts, or else the newest version.
+has contexts (citations without contexts are not cached at all).
 
 Preferring versions with contexts matters because S2 ships every citations
 release (full and incremental) as two exports a few minutes apart, and the
@@ -150,9 +150,12 @@ class CitationCacheBuilder(DuckDBCache):
             "filename = true, union_by_name = true)"
         )
 
-        has_contexts = (
-            "COALESCE(contexts IS NOT NULL AND ARRAY_LENGTH(contexts) > 0 "
-            "AND contexts != ARRAY['null'], false)"
+        # Rows without contexts are never cached, so drop them before
+        # deduplicating; "newest version with contexts" is then simply the
+        # newest remaining row. This also keeps most rows out of the window.
+        with_contexts = (
+            "contexts IS NOT NULL AND ARRAY_LENGTH(contexts) > 0 "
+            "AND contexts != ARRAY['null']"
         )
 
         # Only citations present in more than one file need the (expensive)
@@ -161,12 +164,12 @@ class CitationCacheBuilder(DuckDBCache):
             CREATE OR REPLACE TEMP TABLE duplicate_citations AS
             SELECT citationid
             FROM {source}
-            WHERE citationid IS NOT NULL
+            WHERE citationid IS NOT NULL AND {with_contexts}
             GROUP BY citationid
             HAVING COUNT(*) > 1
         """)
         duplicates = self.row_count("duplicate_citations")
-        print(f"citationids present in more than one file: {duplicates:,}")
+        print(f"citationids with contexts in more than one file: {duplicates:,}")
 
         self.con.execute(f"""
             CREATE OR REPLACE TABLE citation_details AS
@@ -174,6 +177,7 @@ class CitationCacheBuilder(DuckDBCache):
                 SELECT citingcorpusid, citedcorpusid, isinfluential,
                        contexts, intents, citationid, filename
                 FROM {source}
+                WHERE {with_contexts}
             ),
             chosen AS (
                 SELECT * FROM source
@@ -183,13 +187,12 @@ class CitationCacheBuilder(DuckDBCache):
                 SELECT * FROM source
                 WHERE citationid IN (SELECT citationid FROM duplicate_citations)
                 QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY citationid ORDER BY {has_contexts} DESC, filename DESC
+                    PARTITION BY citationid ORDER BY filename DESC
                 ) = 1
             )
             SELECT citingcorpusid, citedcorpusid, isinfluential,
                    contexts, intents, citationid
             FROM chosen
-            WHERE {has_contexts}
             ORDER BY citingcorpusid, citedcorpusid
         """)
         self.con.execute("DROP TABLE IF EXISTS duplicate_citations")
