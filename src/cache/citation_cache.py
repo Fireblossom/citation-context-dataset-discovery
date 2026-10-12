@@ -5,8 +5,14 @@ Builds and queries the citation cache (tables ``citation_details`` and
 ``citing_aggregated``) from Semantic Scholar ``citations`` parquet files.
 
 The input directory may hold a full S2 release plus later incremental update
-files. Every citation is keyed by ``citationid`` and only its version from the
-newest file is kept, so updates replace rows instead of being counted twice.
+files. Every citation is keyed by ``citationid`` and only one version is kept,
+so updates replace rows instead of being counted twice: the newest version that
+has contexts, or else the newest version.
+
+Preferring versions with contexts matters because S2 ships every citations
+release (full and incremental) as two exports a few minutes apart, and the
+later one repeats the same citations with the contexts of publisher-restricted
+citing papers removed (the Graph API still serves them via /citations).
 """
 
 from __future__ import annotations
@@ -144,6 +150,11 @@ class CitationCacheBuilder(DuckDBCache):
             "filename = true, union_by_name = true)"
         )
 
+        has_contexts = (
+            "COALESCE(contexts IS NOT NULL AND ARRAY_LENGTH(contexts) > 0 "
+            "AND contexts != ARRAY['null'], false)"
+        )
+
         # Only citations present in more than one file need the (expensive)
         # window; everything else passes straight through.
         self.con.execute(f"""
@@ -164,7 +175,7 @@ class CitationCacheBuilder(DuckDBCache):
                        contexts, intents, citationid, filename
                 FROM {source}
             ),
-            latest AS (
+            chosen AS (
                 SELECT * FROM source
                 WHERE citationid IS NULL
                    OR citationid NOT IN (SELECT citationid FROM duplicate_citations)
@@ -172,15 +183,13 @@ class CitationCacheBuilder(DuckDBCache):
                 SELECT * FROM source
                 WHERE citationid IN (SELECT citationid FROM duplicate_citations)
                 QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY citationid ORDER BY filename DESC
+                    PARTITION BY citationid ORDER BY {has_contexts} DESC, filename DESC
                 ) = 1
             )
             SELECT citingcorpusid, citedcorpusid, isinfluential,
                    contexts, intents, citationid
-            FROM latest
-            WHERE contexts IS NOT NULL
-              AND ARRAY_LENGTH(contexts) > 0
-              AND contexts != ARRAY['null']
+            FROM chosen
+            WHERE {has_contexts}
             ORDER BY citingcorpusid, citedcorpusid
         """)
         self.con.execute("DROP TABLE IF EXISTS duplicate_citations")

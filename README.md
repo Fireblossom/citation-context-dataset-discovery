@@ -54,9 +54,11 @@ python scripts/1_build_cache.py --citations --data-dir /path/to/s2ag/data
 python scripts/1_build_cache.py --papers --incremental
 ```
 
-When a release and later update files are present, every paper, abstract,
-paper ID and citation is taken from the newest file that contains it (S2AG
-file names start with a timestamp).
+When a release and later update files are present, every paper, abstract and
+paper ID is taken from the newest file that contains it (S2AG file names start
+with a timestamp). For citations the newest version *with contexts* wins: S2AG
+publishes each citations release as two exports, and the later one repeats the
+citations with the contexts of publisher-restricted papers removed.
 
 The full build is memory hungry (on the order of 1 TB of RAM for the complete
 S2AG citations dataset). DuckDB's memory limit, thread count and spill directory
