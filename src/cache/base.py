@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -150,23 +151,61 @@ def deletes_dir_for(data_dir) -> Path:
     return data_dir.parent / f"{data_dir.name}-deletes"
 
 
-def create_latest_deletes_table(con, table: str, deletes_dir, key: str, key_type: str) -> int:
+# Exports of one S2 release are produced within minutes of each other.
+RELEASE_EXPORT_WINDOW = timedelta(minutes=30)
+
+
+def first_export_per_release(files: List[Path]) -> List[Path]:
+    """
+    Keep only the files of the earliest export of each release.
+
+    S2 file names look like ``YYYYMMDD_HHMMSS_NNNNN_xxxxx_<uuid>``; the first
+    four fields identify an export. Exports starting within
+    ``RELEASE_EXPORT_WINDOW`` of a release's first export belong to that
+    release. Files whose name does not parse are kept.
+    """
+    exports, unparsed = {}, []
+    for f in files:
+        parts = f.name.split("_")
+        try:
+            started = datetime.strptime("_".join(parts[:2]), "%Y%m%d_%H%M%S")
+        except ValueError:
+            unparsed.append(f)
+            continue
+        exports.setdefault(("_".join(parts[:4]), started), []).append(f)
+
+    kept, release_start = [], None
+    for (_, started), export_files in sorted(exports.items(), key=lambda e: e[0][1]):
+        if release_start is None or started - release_start > RELEASE_EXPORT_WINDOW:
+            release_start = started
+            kept += export_files
+    return sorted(kept + unparsed)
+
+
+def create_latest_deletes_table(
+    con, table: str, deletes_dir, key: str, key_type: str, first_export_only: bool = False
+) -> int:
     """
     Create TEMP table ``table(key, deleted_in)`` holding, for every key in the
     S2 delete files of ``deletes_dir``, the base name of the newest delete file.
     A row version is deleted when ``deleted_in`` is newer than its own file.
+    With ``first_export_only`` only the earliest delete export of each release
+    is used (see ``first_export_per_release``).
     Returns the number of deleted keys (0, with an empty table, if none).
     """
-    if not list_parquet_files(deletes_dir):
+    files = list_parquet_files(deletes_dir)
+    if first_export_only:
+        files = first_export_per_release(files)
+    if not files:
         con.execute(
             f"CREATE OR REPLACE TEMP TABLE {table} ({key} {key_type}, deleted_in VARCHAR)"
         )
         return 0
+    file_list = "[" + ", ".join(sql_literal(f) for f in files) + "]"
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE {table} AS
         SELECT {key}, MAX({FILE_BASENAME}) AS deleted_in
-        FROM read_parquet({sql_literal(Path(deletes_dir) / '*.parquet')},
-                          filename = true, union_by_name = true)
+        FROM read_parquet({file_list}, filename = true, union_by_name = true)
         WHERE {key} IS NOT NULL
         GROUP BY {key}
     """)

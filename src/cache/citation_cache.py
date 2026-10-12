@@ -15,7 +15,10 @@ later one repeats the same citations with the contexts of publisher-restricted
 citing papers removed (the Graph API still serves them via /citations).
 
 Citation IDs listed in S2 delete files (``<data_dir>-deletes/``) are dropped
-when the delete is newer than the kept version.
+when the delete is newer than the kept version. Deletes come in the same two
+exports; only the first (full) one is applied, because the later one lists
+citations that merely left the reduced export: it deletes citations that the
+full export of the same release still updates.
 """
 
 from __future__ import annotations
@@ -187,7 +190,8 @@ class CitationCacheBuilder(DuckDBCache):
             f"SELECT MIN(citingcorpusid), MAX(citingcorpusid) FROM {source}"
         ).fetchone()
         deleted = create_latest_deletes_table(
-            self.con, "deleted_citations", deletes_dir_for(self.data_dir), "citationid", "BIGINT"
+            self.con, "deleted_citations", deletes_dir_for(self.data_dir), "citationid", "BIGINT",
+            first_export_only=True,
         )
         print(f"citationids in S2 delete files: {deleted:,}")
 
