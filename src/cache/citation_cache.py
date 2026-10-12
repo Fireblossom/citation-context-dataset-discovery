@@ -28,6 +28,11 @@ from src.config import CITATION_CACHE_DB, DEFAULT_CACHE_DIR
 # sorted by citingcorpusid, so each range only reads its own row groups.
 DEFAULT_ID_BATCH_SIZE = 5_000_000
 
+# Number of citingcorpusid ranges citation_details is built in. Each range
+# rescans the parquet files but only has to deduplicate and sort its share of
+# the data; one pass over everything exhausted 1.2 TB of DuckDB memory.
+DEFAULT_DETAIL_PARTITIONS = 16
+
 
 class CitationCacheBuilder(DuckDBCache):
     """
@@ -78,6 +83,7 @@ class CitationCacheBuilder(DuckDBCache):
         force_recreate: bool = False,
         id_batch_size: int = DEFAULT_ID_BATCH_SIZE,
         create_indexes: bool = True,
+        detail_partitions: int = DEFAULT_DETAIL_PARTITIONS,
     ) -> bool:
         """
         Create the citation cache tables from parquet files.
@@ -86,6 +92,7 @@ class CitationCacheBuilder(DuckDBCache):
             force_recreate: Rebuild even if the tables already exist
             id_batch_size: citingcorpusid range aggregated per batch
             create_indexes: Create ART indexes on the corpus ID columns
+            detail_partitions: citingcorpusid ranges citation_details is built in
 
         Returns:
             True if successful
@@ -117,7 +124,7 @@ class CitationCacheBuilder(DuckDBCache):
         start_time = time.time()
 
         print("\nStep 1: Deduplicate, filter and sort into citation_details...")
-        self._create_detail_table()
+        self._create_detail_table(detail_partitions)
 
         print("\nStep 2: Aggregate per citing paper into citing_aggregated...")
         self._create_aggregated_table(id_batch_size)
@@ -143,7 +150,7 @@ class CitationCacheBuilder(DuckDBCache):
         print(f"\n=== Citation cache built in {time.time() - start_time:.0f}s ===")
         return True
 
-    def _create_detail_table(self):
+    def _create_detail_table(self, partitions: int):
         step_start = time.time()
         source = (
             f"read_parquet({sql_literal(Path(self.data_dir) / '*.parquet')}, "
@@ -152,55 +159,59 @@ class CitationCacheBuilder(DuckDBCache):
 
         # Rows without contexts are never cached, so drop them before
         # deduplicating; "newest version with contexts" is then simply the
-        # newest remaining row. This also keeps most rows out of the window.
+        # newest remaining row.
         with_contexts = (
             "contexts IS NOT NULL AND ARRAY_LENGTH(contexts) > 0 "
             "AND contexts != ARRAY['null']"
         )
 
-        # Only citations present in more than one file need the (expensive)
-        # window; everything else passes straight through.
-        self.con.execute(f"""
-            CREATE OR REPLACE TEMP TABLE duplicate_citations AS
-            SELECT citationid
-            FROM {source}
-            WHERE citationid IS NOT NULL AND {with_contexts}
-            GROUP BY citationid
-            HAVING COUNT(*) > 1
-        """)
-        duplicates = self.row_count("duplicate_citations")
-        print(f"citationids with contexts in more than one file: {duplicates:,}")
-
         self.con.execute(f"""
             CREATE OR REPLACE TABLE citation_details AS
-            WITH source AS (
-                SELECT citingcorpusid, citedcorpusid, isinfluential,
-                       contexts, intents, citationid, filename
-                FROM {source}
-                WHERE {with_contexts}
-            ),
-            chosen AS (
-                SELECT * FROM source
-                WHERE citationid IS NULL
-                   OR citationid NOT IN (SELECT citationid FROM duplicate_citations)
-                UNION ALL
-                SELECT * FROM source
-                WHERE citationid IN (SELECT citationid FROM duplicate_citations)
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY citationid ORDER BY filename DESC
-                ) = 1
-            )
             SELECT citingcorpusid, citedcorpusid, isinfluential,
                    contexts, intents, citationid
-            FROM chosen
-            ORDER BY citingcorpusid, citedcorpusid
+            FROM {source}
+            LIMIT 0
         """)
-        self.con.execute("DROP TABLE IF EXISTS duplicate_citations")
+        min_id, max_id = self.con.execute(
+            f"SELECT MIN(citingcorpusid), MAX(citingcorpusid) FROM {source}"
+        ).fetchone()
+
+        # All versions of a citation belong to the same citing paper, so
+        # deduplicating within a citingcorpusid range is enough. Ranges are
+        # inserted in order, which keeps the table sorted by citingcorpusid.
+        ranges = []
+        if min_id is not None:
+            width = (max_id - min_id) // partitions + 1
+            ranges = [(min_id + i * width, min_id + (i + 1) * width - 1) for i in range(partitions)]
+        print(f"Building in {len(ranges)} citingcorpusid ranges (+ rows without citing ID)")
+
+        for num, id_range in enumerate(ranges + [None], start=1):
+            if id_range is None:
+                where, params = "citingcorpusid IS NULL", []
+            else:
+                where, params = "citingcorpusid BETWEEN ? AND ?", list(id_range)
+            self.con.execute(
+                f"""
+                INSERT INTO citation_details
+                SELECT citingcorpusid, citedcorpusid, isinfluential,
+                       contexts, intents, citationid
+                FROM {source}
+                WHERE {where} AND {with_contexts}
+                QUALIFY citationid IS NULL
+                     OR ROW_NUMBER() OVER (PARTITION BY citationid ORDER BY filename DESC) = 1
+                ORDER BY citingcorpusid, citedcorpusid
+                """,
+                params,
+            )
+            print(f"  range {num}/{len(ranges) + 1} done ({time.time() - step_start:.0f}s)")
 
         detail_count = self.row_count("citation_details")
+        leftover = self.con.execute(
+            "SELECT COUNT(citationid) - COUNT(DISTINCT citationid) FROM citation_details"
+        ).fetchone()[0]
         print(
-            f"citation_details: {detail_count:,} rows with contexts "
-            f"({time.time() - step_start:.0f}s)"
+            f"citation_details: {detail_count:,} rows with contexts, "
+            f"{leftover:,} duplicate citationids ({time.time() - step_start:.0f}s)"
         )
 
     def _create_aggregated_table(self, id_batch_size: int):
