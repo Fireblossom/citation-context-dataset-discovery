@@ -18,8 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.cache import PapersCacheBuilder, CitationCacheBuilder, DuckDBSettings
 
 # S2 dataset sub-directories needed by each cache
-PAPERS_SUBDIRS = ["papers", "abstracts", "paper-ids"]
-CITATIONS_SUBDIRS = ["citations"]
+PAPERS_SUBDIRS = [
+    "papers", "abstracts", "paper-ids",
+    "papers-deletes", "abstracts-deletes", "paper-ids-deletes",
+]
+CITATIONS_SUBDIRS = ["citations", "citations-deletes"]
 
 
 def parse_arguments():
@@ -77,9 +80,10 @@ CCDD_DUCKDB_MAX_TEMP_SIZE environment variables.
         "--convert-from",
         type=str,
         default=None,
-        help="Before a full build, convert jsonl.gz files from this directory "
-        "(sub-directories papers/, abstracts/, paper-ids/, citations/) to "
-        "parquet under --data-dir; already converted files are skipped",
+        help="Before building, convert jsonl.gz files from this directory "
+        "(sub-directories papers/, abstracts/, paper-ids/, citations/ and their "
+        "*-deletes/ counterparts) to parquet under --data-dir; already converted "
+        "files are skipped",
     )
     parser.add_argument(
         "--workers",

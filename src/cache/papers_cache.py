@@ -6,7 +6,9 @@ corpusid) from Semantic Scholar ``papers``, ``abstracts`` and ``paper-ids``
 parquet files, and applies incremental updates from newer release files.
 
 Each input directory may hold a full S2 release plus later incremental update
-files; for every key only the version from the newest file is kept.
+files; for every key only the version from the newest file is kept. Keys listed
+in S2 delete files (``<dataset>-deletes/`` next to each dataset directory) are
+dropped when the delete is newer than that version.
 """
 
 from __future__ import annotations
@@ -15,7 +17,14 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.cache.base import DuckDBCache, DuckDBSettings, list_parquet_files, sql_literal
+from src.cache.base import (
+    FILE_BASENAME,
+    DuckDBCache,
+    DuckDBSettings,
+    create_latest_deletes_table,
+    list_parquet_files,
+    sql_literal,
+)
 from src.config import DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR, PAPERS_CACHE_DB
 
 PAPERS_TABLE_SCHEMA = """
@@ -85,6 +94,12 @@ class PapersCacheBuilder(DuckDBCache):
 
     # (source_type recorded in processed_files, sub-directory of data_dir)
     SOURCES = (("papers", "papers"), ("abstracts", "abstracts"), ("paper_ids", "paper-ids"))
+    # (source_type, sub-directory, key column) of the S2 delete files
+    DELETE_SOURCES = (
+        ("papers_deletes", "papers-deletes", "corpusid"),
+        ("abstracts_deletes", "abstracts-deletes", "corpusid"),
+        ("paper_ids_deletes", "paper-ids-deletes", "sha"),
+    )
 
     def __init__(
         self,
@@ -104,8 +119,11 @@ class PapersCacheBuilder(DuckDBCache):
         self.abstracts_dir = Path(self.data_dir) / "abstracts"
         self.paper_ids_dir = Path(self.data_dir) / "paper-ids"
 
-    def _source_dirs(self):
-        return [(source, Path(self.data_dir) / subdir) for source, subdir in self.SOURCES]
+    def _source_dirs(self, with_deletes: bool = False):
+        sources = list(self.SOURCES)
+        if with_deletes:
+            sources += [(source, subdir) for source, subdir, _ in self.DELETE_SOURCES]
+        return [(source, Path(self.data_dir) / subdir) for source, subdir in sources]
 
     def check_data_files(self) -> Dict:
         """Check that the parquet directories exist and report their size."""
@@ -158,33 +176,55 @@ class PapersCacheBuilder(DuckDBCache):
 
         self.con.execute(f"CREATE OR REPLACE TABLE papers_optimized ({PAPERS_TABLE_SCHEMA})")
 
+        for source, subdir, key in self.DELETE_SOURCES:
+            deleted = create_latest_deletes_table(
+                self.con, f"deleted_{source}", Path(self.data_dir) / subdir, key,
+                "VARCHAR" if key == "sha" else "BIGINT",
+            )
+            print(f"{subdir}: {deleted:,} deleted keys")
+
         # papers and abstracts are keyed by corpusid, paper-ids by sha. For each
-        # key keep the row from the newest file; then pick one sha per paper,
-        # preferring the primary one.
+        # key keep the row from the newest file unless a newer delete file lists
+        # it; then pick one sha per paper, preferring the primary one.
         print("Deduplicating, joining and inserting...")
         self.con.execute(f"""
             INSERT INTO papers_optimized ({PAPERS_COLUMNS})
             WITH papers AS (
-                SELECT *
-                FROM read_parquet({papers_glob}, filename = true, union_by_name = true)
-                WHERE corpusid IS NOT NULL
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY corpusid ORDER BY filename DESC, title DESC
-                ) = 1
+                SELECT p.*
+                FROM (
+                    SELECT *, {FILE_BASENAME} AS version_file
+                    FROM read_parquet({papers_glob}, filename = true, union_by_name = true)
+                    WHERE corpusid IS NOT NULL
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY corpusid ORDER BY filename DESC, title DESC
+                    ) = 1
+                ) p
+                LEFT JOIN deleted_papers_deletes d ON p.corpusid = d.corpusid
+                WHERE d.deleted_in IS NULL OR d.deleted_in < p.version_file
             ),
             abstracts AS (
-                SELECT corpusid, abstract
-                FROM read_parquet({abstracts_glob}, filename = true, union_by_name = true)
-                WHERE corpusid IS NOT NULL
-                QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid ORDER BY filename DESC) = 1
+                SELECT a.corpusid, a.abstract
+                FROM (
+                    SELECT corpusid, abstract, {FILE_BASENAME} AS version_file
+                    FROM read_parquet({abstracts_glob}, filename = true, union_by_name = true)
+                    WHERE corpusid IS NOT NULL
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid ORDER BY filename DESC) = 1
+                ) a
+                LEFT JOIN deleted_abstracts_deletes d ON a.corpusid = d.corpusid
+                WHERE d.deleted_in IS NULL OR d.deleted_in < a.version_file
             ),
             paper_ids AS (
                 SELECT corpusid, sha
                 FROM (
-                    SELECT corpusid, sha, "primary"
-                    FROM read_parquet({paper_ids_glob}, filename = true, union_by_name = true)
-                    WHERE corpusid IS NOT NULL
-                    QUALIFY ROW_NUMBER() OVER (PARTITION BY sha ORDER BY filename DESC) = 1
+                    SELECT i.corpusid, i.sha, i."primary"
+                    FROM (
+                        SELECT corpusid, sha, "primary", {FILE_BASENAME} AS version_file
+                        FROM read_parquet({paper_ids_glob}, filename = true, union_by_name = true)
+                        WHERE corpusid IS NOT NULL
+                        QUALIFY ROW_NUMBER() OVER (PARTITION BY sha ORDER BY filename DESC) = 1
+                    ) i
+                    LEFT JOIN deleted_paper_ids_deletes d ON i.sha = d.sha
+                    WHERE d.deleted_in IS NULL OR d.deleted_in < i.version_file
                 )
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY corpusid ORDER BY "primary" DESC NULLS LAST, sha
@@ -204,9 +244,12 @@ class PapersCacheBuilder(DuckDBCache):
             LEFT JOIN paper_ids pid ON p.corpusid = pid.corpusid
         """)
 
+        for source, _, _ in self.DELETE_SOURCES:
+            self.con.execute(f"DROP TABLE IF EXISTS deleted_{source}")
+
         # Everything currently on disk is now in the table, so a later
         # incremental update only has to look at files added after this.
-        for source, directory in self._source_dirs():
+        for source, directory in self._source_dirs(with_deletes=True):
             for parquet_file in list_parquet_files(directory):
                 self.mark_file_processed(parquet_file.name, source)
 
@@ -307,7 +350,8 @@ class PapersCacheBuilder(DuckDBCache):
             print("\nStep 1: Converting jsonl.gz files...")
             from src.utils.jsonl_converter import convert_jsonl_to_parquet
 
-            for _, subdir in self.SOURCES:
+            subdirs = [s for _, s in self.SOURCES] + [s for _, s, _ in self.DELETE_SOURCES]
+            for subdir in subdirs:
                 jsonl_dir = Path(from_jsonl_dir) / subdir
                 if jsonl_dir.exists():
                     convert_jsonl_to_parquet(
@@ -315,11 +359,23 @@ class PapersCacheBuilder(DuckDBCache):
                     )
 
         print("\nStep 2: Detecting new files...")
-        new_papers = self.get_new_files(self.papers_dir, "papers")
-        new_abstracts = self.get_new_files(self.abstracts_dir, "abstracts")
-        new_paper_ids = self.get_new_files(self.paper_ids_dir, "paper_ids")
+        handlers = {
+            "papers": self._apply_papers_file,
+            "abstracts": self._apply_abstracts_file,
+            "paper_ids": self._apply_paper_ids_file,
+            "papers_deletes": self._apply_papers_deletes,
+            "abstracts_deletes": self._apply_abstracts_deletes,
+            "paper_ids_deletes": self._apply_paper_ids_deletes,
+        }
+        # Updates and deletes are applied in file-name (= time) order, so a
+        # record deleted and later re-added ends up present, and vice versa.
+        events = sorted(
+            (parquet_file.name, source, parquet_file)
+            for source, directory in self._source_dirs(with_deletes=True)
+            for parquet_file in self.get_new_files(directory, source)
+        )
 
-        if not (new_papers or new_abstracts or new_paper_ids):
+        if not events:
             print("[OK] No new files to process")
             return True
 
@@ -327,83 +383,19 @@ class PapersCacheBuilder(DuckDBCache):
             print("Cache table missing, running a full build...")
             return self.create_optimized_papers_table()
 
-        print("\nStep 3: Merging new data...")
+        print(f"\nStep 3: Applying {len(events)} new files...")
         start_time = time.time()
         total_new_rows = 0
         errors = 0
-
-        # Paper rows are replaced wholesale, but abstract and sha_id come from
-        # other datasets, so carry the existing values over.
-        for parquet_file in new_papers:
+        for name, source, parquet_file in events:
             try:
-                path = sql_literal(parquet_file)
-                new_count = self.con.execute(
-                    f"SELECT COUNT(*) FROM read_parquet({path})"
-                ).fetchone()[0]
-                self.con.execute(f"""
-                    INSERT OR REPLACE INTO papers_optimized ({PAPERS_COLUMNS}, created_at)
-                    SELECT
-                        n.corpusid,
-                        COALESCE(n.title, '') AS title,
-                        n.year,
-                        COALESCE(n.venue, '') AS venue,
-                        n.authors,
-                        COALESCE(old.abstract, '') AS abstract,
-                        COALESCE(old.sha_id, '') AS sha_id,
-                        {_paper_metadata_select("n")},
-                        CURRENT_TIMESTAMP AS created_at
-                    FROM (
-                        SELECT * FROM read_parquet({path})
-                        WHERE corpusid IS NOT NULL
-                        QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid ORDER BY title DESC) = 1
-                    ) n
-                    LEFT JOIN papers_optimized old ON n.corpusid = old.corpusid
-                """)
-                self.mark_file_processed(parquet_file.name, "papers", new_count)
-                total_new_rows += new_count
-                print(f"  [OK] papers: {parquet_file.name}: {new_count:,} rows")
+                rows = handlers[source](sql_literal(parquet_file))
+                self.mark_file_processed(name, source, rows)
+                total_new_rows += rows if source == "papers" else 0
+                print(f"  [OK] {source}: {name}: {rows:,} rows")
             except Exception as e:
                 errors += 1
-                print(f"  [ERROR] papers: {parquet_file.name}: {e}")
-
-        for parquet_file in new_abstracts:
-            try:
-                self.con.execute(f"""
-                    UPDATE papers_optimized SET abstract = COALESCE(a.abstract, '')
-                    FROM (
-                        SELECT corpusid, abstract FROM read_parquet({sql_literal(parquet_file)})
-                        WHERE corpusid IS NOT NULL
-                        QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid) = 1
-                    ) a
-                    WHERE papers_optimized.corpusid = a.corpusid
-                """)
-                self.mark_file_processed(parquet_file.name, "abstracts")
-                print(f"  [OK] abstracts: {parquet_file.name}")
-            except Exception as e:
-                errors += 1
-                print(f"  [ERROR] abstracts: {parquet_file.name}: {e}")
-
-        # A non-primary sha only fills in papers that have no sha yet.
-        for parquet_file in new_paper_ids:
-            try:
-                self.con.execute(f"""
-                    UPDATE papers_optimized SET sha_id = p.sha
-                    FROM (
-                        SELECT corpusid, sha, "primary"
-                        FROM read_parquet({sql_literal(parquet_file)})
-                        WHERE corpusid IS NOT NULL
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY corpusid ORDER BY "primary" DESC NULLS LAST, sha
-                        ) = 1
-                    ) p
-                    WHERE papers_optimized.corpusid = p.corpusid
-                      AND (p."primary" OR papers_optimized.sha_id = '')
-                """)
-                self.mark_file_processed(parquet_file.name, "paper_ids")
-                print(f"  [OK] paper_ids: {parquet_file.name}")
-            except Exception as e:
-                errors += 1
-                print(f"  [ERROR] paper_ids: {parquet_file.name}: {e}")
+                print(f"  [ERROR] {source}: {name}: {e}")
 
         self.con.execute("CHECKPOINT")
         print("\n=== Incremental update finished ===")
@@ -412,6 +404,85 @@ class PapersCacheBuilder(DuckDBCache):
         print(f"Failed files: {errors}")
         print(f"Elapsed: {time.time() - start_time:.0f}s")
         return errors == 0
+
+    def _file_rows(self, path: str) -> int:
+        return self.con.execute(f"SELECT COUNT(*) FROM read_parquet({path})").fetchone()[0]
+
+    def _apply_papers_file(self, path: str) -> int:
+        # Paper rows are replaced wholesale, but abstract and sha_id come from
+        # other datasets, so carry the existing values over.
+        self.con.execute(f"""
+            INSERT OR REPLACE INTO papers_optimized ({PAPERS_COLUMNS}, created_at)
+            SELECT
+                n.corpusid,
+                COALESCE(n.title, '') AS title,
+                n.year,
+                COALESCE(n.venue, '') AS venue,
+                n.authors,
+                COALESCE(old.abstract, '') AS abstract,
+                COALESCE(old.sha_id, '') AS sha_id,
+                {_paper_metadata_select("n")},
+                CURRENT_TIMESTAMP AS created_at
+            FROM (
+                SELECT * FROM read_parquet({path})
+                WHERE corpusid IS NOT NULL
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid ORDER BY title DESC) = 1
+            ) n
+            LEFT JOIN papers_optimized old ON n.corpusid = old.corpusid
+        """)
+        return self._file_rows(path)
+
+    def _apply_abstracts_file(self, path: str) -> int:
+        self.con.execute(f"""
+            UPDATE papers_optimized SET abstract = COALESCE(a.abstract, '')
+            FROM (
+                SELECT corpusid, abstract FROM read_parquet({path})
+                WHERE corpusid IS NOT NULL
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY corpusid) = 1
+            ) a
+            WHERE papers_optimized.corpusid = a.corpusid
+        """)
+        return self._file_rows(path)
+
+    def _apply_paper_ids_file(self, path: str) -> int:
+        # A non-primary sha only fills in papers that have no sha yet.
+        self.con.execute(f"""
+            UPDATE papers_optimized SET sha_id = p.sha
+            FROM (
+                SELECT corpusid, sha, "primary"
+                FROM read_parquet({path})
+                WHERE corpusid IS NOT NULL
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY corpusid ORDER BY "primary" DESC NULLS LAST, sha
+                ) = 1
+            ) p
+            WHERE papers_optimized.corpusid = p.corpusid
+              AND (p."primary" OR papers_optimized.sha_id = '')
+        """)
+        return self._file_rows(path)
+
+    def _apply_papers_deletes(self, path: str) -> int:
+        self.con.execute(f"""
+            DELETE FROM papers_optimized
+            WHERE corpusid IN (SELECT corpusid FROM read_parquet({path}) WHERE corpusid IS NOT NULL)
+        """)
+        return self._file_rows(path)
+
+    def _apply_abstracts_deletes(self, path: str) -> int:
+        self.con.execute(f"""
+            UPDATE papers_optimized SET abstract = ''
+            WHERE corpusid IN (SELECT corpusid FROM read_parquet({path}) WHERE corpusid IS NOT NULL)
+        """)
+        return self._file_rows(path)
+
+    def _apply_paper_ids_deletes(self, path: str) -> int:
+        # Only the stored sha is known here, so a deleted sha is cleared rather
+        # than replaced by another sha of the paper (a full build would pick one).
+        self.con.execute(f"""
+            UPDATE papers_optimized SET sha_id = ''
+            WHERE sha_id IN (SELECT sha FROM read_parquet({path}) WHERE sha IS NOT NULL)
+        """)
+        return self._file_rows(path)
 
     # ==================== Queries ====================
 

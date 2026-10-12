@@ -13,6 +13,9 @@ Preferring versions with contexts matters because S2 ships every citations
 release (full and incremental) as two exports a few minutes apart, and the
 later one repeats the same citations with the contexts of publisher-restricted
 citing papers removed (the Graph API still serves them via /citations).
+
+Citation IDs listed in S2 delete files (``<data_dir>-deletes/``) are dropped
+when the delete is newer than the kept version.
 """
 
 from __future__ import annotations
@@ -21,7 +24,15 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.cache.base import DuckDBCache, DuckDBSettings, list_parquet_files, sql_literal
+from src.cache.base import (
+    FILE_BASENAME,
+    DuckDBCache,
+    DuckDBSettings,
+    create_latest_deletes_table,
+    deletes_dir_for,
+    list_parquet_files,
+    sql_literal,
+)
 from src.config import CITATION_CACHE_DB, DEFAULT_CACHE_DIR
 
 # Range of citingcorpusid values aggregated per INSERT. citation_details is
@@ -175,6 +186,10 @@ class CitationCacheBuilder(DuckDBCache):
         min_id, max_id = self.con.execute(
             f"SELECT MIN(citingcorpusid), MAX(citingcorpusid) FROM {source}"
         ).fetchone()
+        deleted = create_latest_deletes_table(
+            self.con, "deleted_citations", deletes_dir_for(self.data_dir), "citationid", "BIGINT"
+        )
+        print(f"citationids in S2 delete files: {deleted:,}")
 
         # All versions of a citation belong to the same citing paper, so
         # deduplicating within a citingcorpusid range is enough. Ranges are
@@ -193,17 +208,23 @@ class CitationCacheBuilder(DuckDBCache):
             self.con.execute(
                 f"""
                 INSERT INTO citation_details
-                SELECT citingcorpusid, citedcorpusid, isinfluential,
-                       contexts, intents, citationid
-                FROM {source}
-                WHERE {where} AND {with_contexts}
-                QUALIFY citationid IS NULL
-                     OR ROW_NUMBER() OVER (PARTITION BY citationid ORDER BY filename DESC) = 1
-                ORDER BY citingcorpusid, citedcorpusid
+                SELECT c.citingcorpusid, c.citedcorpusid, c.isinfluential,
+                       c.contexts, c.intents, c.citationid
+                FROM (
+                    SELECT *, {FILE_BASENAME} AS version_file
+                    FROM {source}
+                    WHERE {where} AND {with_contexts}
+                    QUALIFY citationid IS NULL
+                         OR ROW_NUMBER() OVER (PARTITION BY citationid ORDER BY filename DESC) = 1
+                ) c
+                LEFT JOIN deleted_citations d ON c.citationid = d.citationid
+                WHERE d.deleted_in IS NULL OR d.deleted_in < c.version_file
+                ORDER BY c.citingcorpusid, c.citedcorpusid
                 """,
                 params,
             )
             print(f"  range {num}/{len(ranges) + 1} done ({time.time() - step_start:.0f}s)")
+        self.con.execute("DROP TABLE IF EXISTS deleted_citations")
 
         detail_count = self.row_count("citation_details")
         leftover = self.con.execute(

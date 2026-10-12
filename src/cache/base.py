@@ -139,6 +139,40 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+# Base name of the source file of a row read with read_parquet(..., filename = true).
+# S2 file names start with a timestamp, so comparing them orders versions in time.
+FILE_BASENAME = "regexp_extract(filename, '[^/]+$')"
+
+
+def deletes_dir_for(data_dir) -> Path:
+    """S2 delete files of a dataset live next to it in <dataset>-deletes/."""
+    data_dir = Path(data_dir)
+    return data_dir.parent / f"{data_dir.name}-deletes"
+
+
+def create_latest_deletes_table(con, table: str, deletes_dir, key: str, key_type: str) -> int:
+    """
+    Create TEMP table ``table(key, deleted_in)`` holding, for every key in the
+    S2 delete files of ``deletes_dir``, the base name of the newest delete file.
+    A row version is deleted when ``deleted_in`` is newer than its own file.
+    Returns the number of deleted keys (0, with an empty table, if none).
+    """
+    if not list_parquet_files(deletes_dir):
+        con.execute(
+            f"CREATE OR REPLACE TEMP TABLE {table} ({key} {key_type}, deleted_in VARCHAR)"
+        )
+        return 0
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE {table} AS
+        SELECT {key}, MAX({FILE_BASENAME}) AS deleted_in
+        FROM read_parquet({sql_literal(Path(deletes_dir) / '*.parquet')},
+                          filename = true, union_by_name = true)
+        WHERE {key} IS NOT NULL
+        GROUP BY {key}
+    """)
+    return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
 class DuckDBCache:
     """Owns the connection to one persistent DuckDB cache file."""
 
