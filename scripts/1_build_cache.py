@@ -15,7 +15,12 @@ import argparse
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.cache import PapersCacheBuilder, CitationCacheBuilder, DuckDBSettings
+from src.cache import (
+    CitationCacheBuilder,
+    CitationEdgesBuilder,
+    DuckDBSettings,
+    PapersCacheBuilder,
+)
 
 # S2 dataset sub-directories needed by each cache
 PAPERS_SUBDIRS = [
@@ -61,6 +66,12 @@ CCDD_DUCKDB_MAX_TEMP_SIZE environment variables.
     )
     parser.add_argument(
         "--citations", action="store_true", help="Build citations cache table"
+    )
+    parser.add_argument(
+        "--edges",
+        action="store_true",
+        help="Build the all-citations edge cache (citations_all.db, with or "
+        "without contexts)",
     )
     parser.add_argument("--all", action="store_true", help="Build all cache tables")
 
@@ -206,10 +217,34 @@ def build_citation_cache(args, settings) -> bool:
     return False
 
 
+def build_edges_cache(args, settings) -> bool:
+    """Build the all-citations edge cache."""
+    print("\n=== Building Citation Edges Cache ===")
+
+    try:
+        with CitationEdgesBuilder(
+            data_dir=os.path.join(args.data_dir, "citations"),
+            cache_dir=args.cache_dir,
+            settings=settings,
+        ) as builder:
+            if builder.create_edges_tables(force_recreate=args.force):
+                builder.show_cache_info()
+                print("[OK] Citation edges cache build complete")
+                return True
+
+    except Exception as e:
+        print(f"[ERROR] Citation edges cache build failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    return False
+
+
 def main():
     args = parse_arguments()
 
-    if not any([args.papers, args.citations, args.all]):
+    if not any([args.papers, args.citations, args.edges, args.all]):
         print("Please specify cache type to build. Use --help for options.")
         return 1
 
@@ -221,10 +256,11 @@ def main():
     )
     build_papers = args.all or args.papers
     build_citations = args.all or args.citations
+    build_edges = args.all or args.edges
 
     if args.convert_from:
         subdirs = (PAPERS_SUBDIRS if build_papers else []) + (
-            CITATIONS_SUBDIRS if build_citations else []
+            CITATIONS_SUBDIRS if build_citations or build_edges else []
         )
         if not convert_raw_data(args, subdirs):
             print(
@@ -241,6 +277,10 @@ def main():
 
     if build_citations:
         if not build_citation_cache(args, settings):
+            success = False
+
+    if build_edges:
+        if not build_edges_cache(args, settings):
             success = False
 
     if success:

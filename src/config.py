@@ -23,3 +23,4 @@ DEFAULT_CITATION_DATA_DIR = "data/citations"
 # Database files
 CITATION_CACHE_DB = "optimized_cache.db"
 PAPERS_CACHE_DB = "papers_optimized_cache_1.db"
+CITATION_EDGES_DB = "citations_all.db"

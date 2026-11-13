@@ -49,6 +49,7 @@ python scripts/1_build_cache.py --all --convert-from /path/to/s2ag/raw --data-di
 
 python scripts/1_build_cache.py --papers --data-dir /path/to/s2ag/data
 python scripts/1_build_cache.py --citations --data-dir /path/to/s2ag/data
+python scripts/1_build_cache.py --edges --data-dir /path/to/s2ag/data
 
 # Incremental update
 python scripts/1_build_cache.py --papers --incremental
@@ -70,6 +71,39 @@ are derived from the Slurm allocation / cgroup / host and can be overridden with
 sbatch -c 64 --mem=1500G -t 2-00:00:00 --wrap \
   "python scripts/1_build_cache.py --all --convert-from /path/to/s2ag/raw --data-dir data --workers 60"
 ```
+
+#### All citations, with or without contexts
+
+The citation cache (`optimized_cache.db`) only keeps citations that have
+contexts, about a third of S2AG (1.13 of 3.16 billion). `--edges` (also part of `--all`) builds
+`citations_all.db` with every citation as a narrow edge list, using the same
+version and delete rules:
+
+| Table | Columns | Sorted by |
+|---|---|---|
+| `edges` | citingcorpusid, citedcorpusid, isinfluential, has_context, citationid | citing, cited |
+| `edges_by_cited` | same rows | cited, citing |
+| `cited_counts` | citedcorpusid, n_citations, n_with_context, n_influential | cited |
+| `citing_counts` | citingcorpusid, n_references, n_with_context, n_influential | citing |
+
+Each edge table is sorted on its lookup key, so zone maps turn a lookup into a
+read of a few row groups without an ART index. Query `edges` by citing paper and
+`edges_by_cited` by cited paper. `has_context` is true exactly for the
+citations in `citation_details`, so contexts can be joined on `citationid`:
+
+```sql
+ATTACH 'cache/optimized_cache.db' AS ctx (READ_ONLY);
+SELECT e.citingcorpusid, e.has_context, d.contexts
+FROM edges_by_cited e
+LEFT JOIN ctx.citation_details d
+       ON e.has_context AND d.citationid = e.citationid
+      AND d.citingcorpusid = e.citingcorpusid
+WHERE e.citedcorpusid = 12345;
+```
+
+The build reads all citation versions once into a narrow staging table, so it
+needs less memory than the citation cache (about 750 GB peak and 22 minutes
+on 64 cores for the full S2AG: 6.2 billion citation versions, 3.2 billion edges).
 
 ### Stage 2: Query Citation Contexts
 
